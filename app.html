@@ -2301,12 +2301,18 @@ function renderTxItem(t) {
     parcelaBar = `<div class="tx-parcela-bar"><div class="tx-parcela-fill" style="width:${pct}%"></div></div>`;
   }
 
+  // Nota: usa a nota da transação OU a nota do parcelamento (sem precisar digitar de novo)
+  const nb = t.nomeBase || nome;
+  const keyParc = nb + '|' + (t.totalParcelas||1) + '|' + (t.usuario||'');
+  const notaParc = t.totalParcelas > 1 && cfgGeral.notasParcelas ? cfgGeral.notasParcelas[keyParc] : null;
+  const notaExibir = t.nota || notaParc || '';
+
   return `<div class="tx-item ${isPrev?'previsto':''}">
     <div class="tx-cat-dot" style="background:${cat.cor}"></div>
     <div class="tx-info">
       <div class="tx-nome">${isPrev?'🕐 ':''} ${nome}</div>
       ${orig ? `<div class="tx-original">${orig}</div>` : ''}
-      ${t.nota ? `<div class="tx-original" style="color:var(--blue);font-style:italic;">📝 ${t.nota}</div>` : ''}
+      ${notaExibir ? `<div class="tx-original" style="color:var(--blue);font-style:italic;">📝 ${notaExibir}</div>` : ''}
       <div class="tx-meta">
         <span class="tx-date">${fmtData(t.data)}</span>
         ${usrBadge}
