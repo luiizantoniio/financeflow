@@ -1633,6 +1633,49 @@ body {
   </div>
 </div>
 
+<!-- Modal Cartão -->
+<div class="mo" id="moCartao">
+  <div class="mo-box">
+    <div class="mo-header">
+      <span class="mo-title">Cartão</span>
+      <button class="mo-close" onclick="closeMo('moCartao')">✕</button>
+    </div>
+    <input type="hidden" id="cartaoId">
+    <div class="fg">
+      <label>Banco / Instituição</label>
+      <input type="text" id="cartaoBanco" placeholder="Ex: Nubank, Itaú, Bradesco">
+    </div>
+    <div class="fg-row">
+      <div class="fg">
+        <label>Bandeira</label>
+        <select id="cartaoBandeira">
+          <option value="visa">Visa</option>
+          <option value="master">Mastercard</option>
+          <option value="elo">Elo</option>
+          <option value="amex">American Express</option>
+          <option value="hipercard">Hipercard</option>
+          <option value="outro">Outro</option>
+        </select>
+      </div>
+      <div class="fg">
+        <label>Titular</label>
+        <select id="cartaoTitular">
+          <option value="luiz">🟣 Luiz</option>
+          <option value="fernanda">🌸 Fernanda</option>
+        </select>
+      </div>
+    </div>
+    <div class="fg">
+      <label>4 últimos dígitos (opcional)</label>
+      <input type="text" id="cartaoFinal" placeholder="Ex: 1234" maxlength="4">
+    </div>
+    <div class="mo-footer">
+      <button class="btn btn-ghost" onclick="closeMo('moCartao')">Cancelar</button>
+      <button class="btn btn-primary" onclick="salvarCartao()">Salvar</button>
+    </div>
+  </div>
+</div>
+
 <!-- TOASTS -->
 <div id="toastContainer"></div>
 
@@ -1670,6 +1713,7 @@ let cacheFixos        = [];
 let cacheDividas      = [];
 let cacheAssinaturas  = [];
 let cacheAliases      = [];
+let cacheCartoes      = [];
 let categorias        = [];
 let limites           = {};
 let cfgGeral          = {};
@@ -1760,8 +1804,9 @@ function carregarDados() {
   const p8 = db.collection('categorias').get();
   const p9 = db.collection('config').doc('geral').get();
   const p10= db.collection('transacoes').get(); // para parcelamentos
+  const p11= db.collection('cartoes').get();
 
-  Promise.all([p1,p2,p3,p4,p5,p6,p7,p8,p9,p10]).then(function(results) {
+  Promise.all([p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11]).then(function(results) {
     cacheTx            = snapToArr(results[0]);
     cacheEntradas      = snapToArr(results[1]);
     cacheEntradasFixas = snapToArr(results[2]);
@@ -1800,6 +1845,7 @@ function carregarDados() {
     limites  = cfgGeral.limites || {};
 
     cacheParcelamentos = snapToArr(results[9]).filter(function(t) { return t.totalParcelas > 1; });
+    cacheCartoes       = snapToArr(results[10]);
 
     // fallback email→usuario
     cacheTx = cacheTx.map(normalizarUsuario);
@@ -1902,15 +1948,15 @@ function renderDashboard() {
   const pins = cfgGeral.categoriasPinadas || [];
 
   if (dashTab === 'casal') {
-    const luizTx    = cacheTx.filter(function(t) { return t.usuario === 'luiz'; });
-    const fernTx    = cacheTx.filter(function(t) { return t.usuario === 'fernanda'; });
-    const luizEnt   = calcEntradas('luiz');
-    const fernEnt   = calcEntradas('fernanda');
-    const luizSai   = calcSaidas(luizTx);
-    const fernSai   = calcSaidas(fernTx);
-    const totalEnt  = calcEntradas(null);
-    const totalSai  = calcSaidas(cacheTx);
-    const saldo     = totalEnt - (totalSai.conf + totalSai.prev);
+    const luizTx  = cacheTx.filter(function(t) { return t.usuario === 'luiz'; });
+    const fernTx  = cacheTx.filter(function(t) { return t.usuario === 'fernanda'; });
+    const luizEnt = calcEntradas('luiz');
+    const fernEnt = calcEntradas('fernanda');
+    const luizSai = calcSaidas(luizTx);
+    const fernSai = calcSaidas(fernTx);
+    const totalEnt = calcEntradas(null);
+    const totalSai = calcSaidas(cacheTx);
+    const saldo = totalEnt.total - (totalSai.conf + totalSai.prev);
 
     el.innerHTML = `
       <div class="mini-cards">
@@ -1919,7 +1965,7 @@ function renderDashboard() {
             <div class="mini-card-dot" style="background:var(--luiz)"></div>
             <span class="mini-card-name" style="color:var(--luiz)">Luiz</span>
           </div>
-          <div class="mini-card-row"><span class="mini-card-row-label">Entrou</span><span class="mini-card-row-val green">${fmtR(luizEnt)}</span></div>
+          <div class="mini-card-row"><span class="mini-card-row-label">Entrou</span><span class="mini-card-row-val green">${fmtR(luizEnt.total)}</span></div>
           <div class="mini-card-row"><span class="mini-card-row-label">Saiu</span><span class="mini-card-row-val red">${fmtR(luizSai.conf+luizSai.prev)}</span></div>
         </div>
         <div class="mini-card">
@@ -1927,25 +1973,38 @@ function renderDashboard() {
             <div class="mini-card-dot" style="background:var(--fernanda)"></div>
             <span class="mini-card-name" style="color:var(--fernanda)">Fernanda</span>
           </div>
-          <div class="mini-card-row"><span class="mini-card-row-label">Entrou</span><span class="mini-card-row-val green">${fmtR(fernEnt)}</span></div>
+          <div class="mini-card-row"><span class="mini-card-row-label">Entrou</span><span class="mini-card-row-val green">${fmtR(fernEnt.total)}</span></div>
           <div class="mini-card-row"><span class="mini-card-row-label">Saiu</span><span class="mini-card-row-val red">${fmtR(fernSai.conf+fernSai.prev)}</span></div>
         </div>
       </div>
       <div class="stats-grid stats-grid-3" style="margin-bottom:20px;">
         <div class="stat-card">
-          <div class="stat-label">💚 Total Entrou</div>
-          <div class="stat-value green">${fmtR(totalEnt)}</div>
+          <div class="stat-label">💚 Entradas</div>
+          <div class="stat-value green">${fmtR(totalEnt.total)}</div>
+          <div class="stat-sub" style="margin-top:6px;line-height:1.6;">
+            <span style="color:var(--text2);">Recorrentes:</span> <strong>${fmtR(totalEnt.recorrentes)}</strong><br>
+            <span style="color:var(--text2);">Avulsas:</span> <strong>${fmtR(totalEnt.avulsas)}</strong>
+          </div>
         </div>
         <div class="stat-card">
-          <div class="stat-label">🔴 Total Saiu</div>
+          <div class="stat-label">🔴 Saídas</div>
           <div class="stat-value red">${fmtR(totalSai.conf+totalSai.prev)}</div>
-          <div class="stat-sub">${fmtR(totalSai.conf)} confirmado · ${fmtR(totalSai.prev)} previsto</div>
+          <div class="stat-sub" style="margin-top:6px;line-height:1.6;">
+            <span style="color:var(--text2);">Fixos:</span> <strong>${fmtR(totalSai.fixos)}</strong><br>
+            <span style="color:var(--text2);">Parcelamentos:</span> <strong>${fmtR(totalSai.parcelamentos)}</strong><br>
+            <span style="color:var(--text2);">Mensal:</span> <strong>${fmtR(totalSai.mensal)}</strong>
+          </div>
         </div>
         <div class="stat-card">
           <div class="stat-label">💰 Saldo</div>
           <div class="stat-value ${saldo>=0?'green':'red'}">${fmtR(saldo)}</div>
+          <div class="stat-sub" style="margin-top:6px;">
+            <span style="color:var(--green);">✅ ${fmtR(totalSai.conf)}</span> confirmado<br>
+            <span style="color:var(--yellow);">🕐 ${fmtR(totalSai.prev)}</span> previsto
+          </div>
         </div>
       </div>
+      ${renderCartoes()}
       ${renderCatGrid(cacheTx, pins)}
       ${renderTxDash(cacheTx)}
     `;
@@ -1954,23 +2013,35 @@ function renderDashboard() {
     const txU = cacheTx.filter(function(t) { return t.usuario === usr; });
     const ent = calcEntradas(usr);
     const sai = calcSaidas(txU);
-    const sal = ent - (sai.conf + sai.prev);
-    const nome= usr === 'luiz' ? 'Luiz' : 'Fernanda';
+    const sal = ent.total - (sai.conf + sai.prev);
+    const nome = usr === 'luiz' ? 'Luiz' : 'Fernanda';
 
     el.innerHTML = `
       <div class="stats-grid stats-grid-3" style="margin-bottom:20px;">
         <div class="stat-card">
-          <div class="stat-label">💚 Entrou — ${nome}</div>
-          <div class="stat-value green">${fmtR(ent)}</div>
+          <div class="stat-label">💚 Entradas — ${nome}</div>
+          <div class="stat-value green">${fmtR(ent.total)}</div>
+          <div class="stat-sub" style="margin-top:6px;line-height:1.6;">
+            <span style="color:var(--text2);">Recorrentes:</span> <strong>${fmtR(ent.recorrentes)}</strong><br>
+            <span style="color:var(--text2);">Avulsas:</span> <strong>${fmtR(ent.avulsas)}</strong>
+          </div>
         </div>
         <div class="stat-card">
-          <div class="stat-label">🔴 Saiu — ${nome}</div>
+          <div class="stat-label">🔴 Saídas — ${nome}</div>
           <div class="stat-value red">${fmtR(sai.conf+sai.prev)}</div>
-          <div class="stat-sub">${fmtR(sai.conf)} confirmado · ${fmtR(sai.prev)} previsto</div>
+          <div class="stat-sub" style="margin-top:6px;line-height:1.6;">
+            <span style="color:var(--text2);">Fixos:</span> <strong>${fmtR(sai.fixos)}</strong><br>
+            <span style="color:var(--text2);">Parcelamentos:</span> <strong>${fmtR(sai.parcelamentos)}</strong><br>
+            <span style="color:var(--text2);">Mensal:</span> <strong>${fmtR(sai.mensal)}</strong>
+          </div>
         </div>
         <div class="stat-card">
           <div class="stat-label">💰 Saldo — ${nome}</div>
           <div class="stat-value ${sal>=0?'green':'red'}">${fmtR(sal)}</div>
+          <div class="stat-sub" style="margin-top:6px;">
+            <span style="color:var(--green);">✅ ${fmtR(sai.conf)}</span> confirmado<br>
+            <span style="color:var(--yellow);">🕐 ${fmtR(sai.prev)}</span> previsto
+          </div>
         </div>
       </div>
       ${renderCatGrid(txU, pins)}
@@ -2024,26 +2095,113 @@ function renderTxDash(txArr) {
 }
 
 function calcEntradas(usr) {
-  let total = 0;
-  // entradas fixas (recorrentes) — considerar confirmadas
+  let recorrentes = 0, avulsas = 0;
   cacheEntradasFixas.forEach(function(e) {
-    if (!usr || e.usuario === usr) total += Number(e.valor)||0;
+    if (!usr || e.usuario === usr) recorrentes += Number(e.valor)||0;
   });
-  // entradas avulsas confirmadas do mês
   cacheEntradas.forEach(function(e) {
-    if (!usr || e.usuario === usr) total += Number(e.valor)||0;
+    if (!usr || e.usuario === usr) avulsas += Number(e.valor)||0;
   });
-  return total;
+  return { total: recorrentes + avulsas, recorrentes, avulsas };
 }
 
 function calcSaidas(txArr) {
-  let conf = 0, prev = 0;
+  let conf = 0, prev = 0, fixos = 0, parcelamentos = 0, mensal = 0;
   txArr.forEach(function(t) {
     const v = Number(t.valor)||0;
-    if (t.status === 'confirmado') conf += v;
-    else prev += v;
+    if (t.status === 'confirmado') conf += v; else prev += v;
+    if (t.tipo === 'fixo' || t.fixoId) fixos += v;
+    else if (t.totalParcelas > 1) parcelamentos += v;
+    else mensal += v;
   });
-  return { conf, prev };
+  return { conf, prev, fixos, parcelamentos, mensal };
+}
+
+function renderCartoes() {
+  const bandeiras = { visa:'💳 Visa', master:'💳 Master', elo:'💳 Elo', amex:'💳 Amex', hipercard:'💳 Hiper', outro:'💳 Outro' };
+  const titulares = { luiz:'🟣 Luiz', fernanda:'🌸 Fernanda' };
+
+  const cards = cacheCartoes.map(function(c) {
+    const gradiente = c.titular === 'fernanda'
+      ? 'linear-gradient(135deg, #ec4899 0%, #f472b6 100%)'
+      : 'linear-gradient(135deg, #6366f1 0%, #818cf8 100%)';
+    return `<div style="background:${gradiente};border-radius:14px;padding:18px 20px;color:#fff;min-width:220px;max-width:240px;flex-shrink:0;position:relative;box-shadow:0 4px 16px rgba(0,0,0,0.12);">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px;">
+        <div style="font-size:.75rem;font-weight:700;opacity:.8;text-transform:uppercase;letter-spacing:.05em;">${c.banco||'Banco'}</div>
+        <div style="display:flex;gap:6px;">
+          <button onclick="editarCartao('${c.id}')" style="background:rgba(255,255,255,.2);border:none;border-radius:6px;padding:3px 7px;cursor:pointer;color:#fff;font-size:.75rem;">✏️</button>
+          <button onclick="excluirCartao('${c.id}')" style="background:rgba(255,255,255,.2);border:none;border-radius:6px;padding:3px 7px;cursor:pointer;color:#fff;font-size:.75rem;">🗑</button>
+        </div>
+      </div>
+      <div style="font-size:1rem;font-weight:700;letter-spacing:.12em;margin-bottom:12px;">•••• •••• •••• ${c.final||'????'}</div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;">
+        <div>
+          <div style="font-size:.65rem;opacity:.7;text-transform:uppercase;">Titular</div>
+          <div style="font-size:.82rem;font-weight:600;">${titulares[c.titular]||c.titular||'—'}</div>
+        </div>
+        <div style="text-align:right;">
+          <div style="font-size:.65rem;opacity:.7;text-transform:uppercase;">Bandeira</div>
+          <div style="font-size:.82rem;font-weight:600;">${c.bandeira||'—'}</div>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+
+  return `<div style="margin-bottom:20px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+      <h3 style="font-size:.8rem;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.05em;">💳 Cartões</h3>
+      <button onclick="abrirModalCartao()" style="background:none;border:1px solid var(--border);border-radius:7px;padding:4px 10px;font-size:.78rem;color:var(--luiz);cursor:pointer;font-family:'DM Sans',sans-serif;font-weight:600;">+ Adicionar</button>
+    </div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;">
+      ${cards || '<span style="font-size:.85rem;color:var(--text3);">Nenhum cartão cadastrado.</span>'}
+    </div>
+  </div>`;
+}
+
+function abrirModalCartao(id) {
+  document.getElementById('cartaoId').value      = id || '';
+  document.getElementById('cartaoBanco').value   = '';
+  document.getElementById('cartaoBandeira').value= 'visa';
+  document.getElementById('cartaoTitular').value = 'luiz';
+  document.getElementById('cartaoFinal').value   = '';
+  if (id) {
+    const c = cacheCartoes.find(function(x) { return x.id === id; });
+    if (c) {
+      document.getElementById('cartaoBanco').value    = c.banco || '';
+      document.getElementById('cartaoBandeira').value = c.bandeira || 'visa';
+      document.getElementById('cartaoTitular').value  = c.titular || 'luiz';
+      document.getElementById('cartaoFinal').value    = c.final || '';
+    }
+  }
+  openMo('moCartao');
+}
+
+function editarCartao(id) { abrirModalCartao(id); }
+
+function salvarCartao() {
+  const id       = document.getElementById('cartaoId').value;
+  const banco    = document.getElementById('cartaoBanco').value.trim();
+  const bandeira = document.getElementById('cartaoBandeira').value;
+  const titular  = document.getElementById('cartaoTitular').value;
+  const final    = document.getElementById('cartaoFinal').value.trim();
+  if (!banco) { toast('Informe o nome do banco.', 'error'); return; }
+  const doc = { banco, bandeira, titular, final };
+  const col = db.collection('cartoes');
+  const promise = id ? col.doc(id).update(doc) : col.add(doc);
+  promise.then(function() {
+    toast('Cartao salvo!', 'success');
+    closeMo('moCartao');
+    carregarDados();
+  });
+}
+
+function excluirCartao(id) {
+  if (!confirm('Excluir este cartao?')) return;
+  db.collection('cartoes').doc(id).delete().then(function() {
+    cacheCartoes = cacheCartoes.filter(function(x) { return x.id !== id; });
+    toast('Cartao excluido.', 'info');
+    renderPagina(paginaAtual);
+  });
 }
 
 function renderCatGrid(txArr, pins) {
@@ -2159,9 +2317,10 @@ function renderTxItem(t) {
     </div>
     <div class="tx-valor red">${fmtR(t.valor)}</div>
     <div class="tx-actions">
-      ${isPrev ? `<button class="tx-btn confirm" onclick="confirmarTx('${t.id}')">✓</button>` : ''}
-      <button class="tx-btn" onclick="editarTx('${t.id}')">✏️</button>
-      <button class="tx-btn del" onclick="excluirTx('${t.id}')">🗑</button>
+      ${isPrev ? `<button class="tx-btn confirm" onclick="confirmarTx('${t.id}')" title="Confirmar">✓</button>` : ''}
+      <button class="tx-btn" onclick="editarTx('${t.id}')" title="Editar nome/nota/dados">✏️</button>
+      <button class="tx-btn" onclick="abrirAlias('${t.id}')" title="Editar categoria">🏷️</button>
+      <button class="tx-btn del" onclick="excluirTx('${t.id}')" title="Excluir">🗑</button>
     </div>
   </div>`;
 }
