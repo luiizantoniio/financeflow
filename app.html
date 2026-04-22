@@ -2280,56 +2280,57 @@ function renderImportar() {
   document.getElementById('triagemContainer').style.display = 'none';
 }
 
-function limparMesImport(incluirParcelasFuturas) {
+function limparMesImport(incluirTudo) {
   var nomeUsr = usuarioImportAtual === 'luiz' ? 'Luiz' : 'Fernanda';
-  var msg = incluirParcelasFuturas
-    ? 'Excluir TODAS as transacoes de ' + nomeUsr + ' (mes atual + parcelas futuras projetadas)?'
+  var msg = incluirTudo
+    ? 'ATENCAO: Isso vai excluir TODAS as transacoes de ' + nomeUsr + ' em TODOS os meses (incluindo parcelas futuras). Confirma?'
     : 'Excluir todas as transacoes de ' + MES_PT[mesSel-1] + '/' + anoSel + ' para ' + nomeUsr + '?';
   if (!confirm(msg)) return;
   showLoading(true);
 
-  function pertenceAoUsuario(d) {
-    var u = d.usuario;
-    var e = d.email || '';
-    if (u) return u === usuarioImportAtual;
-    if (usuarioImportAtual === 'luiz')     return e.includes('luiz') || e === '';
-    if (usuarioImportAtual === 'fernanda') return e.includes('fernanda');
-    return false;
+  function ehDoUsuario(data) {
+    // 1. campo usuario direto
+    if (data.usuario) return data.usuario === usuarioImportAtual;
+    // 2. campo email como fallback
+    var e = data.email || '';
+    if (usuarioImportAtual === 'fernanda') return e.toLowerCase().includes('fernanda');
+    // luiz: email luiz OU sem email nenhum
+    return e.toLowerCase().includes('luiz') || e === '';
   }
 
-  var query;
-  if (incluirParcelasFuturas) {
-    // busca todas as transacoes do usuario (sem filtro de mes)
-    query = db.collection('transacoes').get();
-  } else {
-    // busca so o mes atual
-    query = db.collection('transacoes').where('mes','==',mesStr()).get();
-  }
+  // Se incluirTudo, busca em todos os meses; senao so o mes atual
+  var promise = incluirTudo
+    ? db.collection('transacoes').get()
+    : db.collection('transacoes').where('mes', '==', mesStr()).get();
 
-  query.then(function(snap) {
-    var docsParaDeletar = snap.docs.filter(function(d) {
-      return pertenceAoUsuario(d.data());
-    });
+  promise.then(function(snap) {
+    console.log('Total docs no Firestore encontrados:', snap.size);
 
-    if (docsParaDeletar.length === 0) {
+    var alvo = snap.docs.filter(function(d) { return ehDoUsuario(d.data()); });
+    console.log('Docs para deletar:', alvo.length);
+
+    if (alvo.length === 0) {
       showLoading(false);
       toast('Nenhuma transacao encontrada para limpar.', 'info');
-      return Promise.resolve();
+      return;
     }
 
+    // Deletar em lotes de 400
     var lotes = [];
-    for (var i = 0; i < docsParaDeletar.length; i += 400) {
+    for (var i = 0; i < alvo.length; i += 400) {
       var batch = db.batch();
-      docsParaDeletar.slice(i, i + 400).forEach(function(d) { batch.delete(d.ref); });
+      alvo.slice(i, i + 400).forEach(function(d) { batch.delete(d.ref); });
       lotes.push(batch.commit());
     }
     return Promise.all(lotes);
-  }).then(function() {
-    toast('Limpeza concluida com sucesso!', 'success');
+  }).then(function(res) {
+    if (!res) return;
+    toast('Limpeza concluida!', 'success');
     carregarDados();
   }).catch(function(e) {
+    console.error('Erro limpar:', e);
     showLoading(false);
-    toast('Erro ao limpar: ' + e.message, 'error');
+    toast('Erro: ' + e.message, 'error');
   });
 }
 
@@ -2949,7 +2950,10 @@ function renderParcelamentos() {
           <span class="section-card-title">${g.nome}</span>
           <span style="margin-left:8px;">${usrBadge}</span>
         </div>
-        ${previstas.length > 0 ? `<button class="btn btn-ghost" style="font-size:.8rem;padding:5px 10px;" onclick="abrirAdiantar(${JSON.stringify(key).replace(/"/g,'&quot;')})">⏩ Adiantar</button>` : ''}
+        <div style="display:flex;gap:6px;">
+          ${previstas.length > 0 ? `<button class="btn btn-ghost" style="font-size:.8rem;padding:5px 10px;" onclick="abrirAdiantar(${JSON.stringify(key).replace(/"/g,'&quot;')})">⏩ Adiantar</button>` : ''}
+          <button class="btn btn-ghost" style="font-size:.8rem;padding:5px 10px;color:var(--red);border-color:#fecaca;" onclick="excluirParcelamento(${JSON.stringify(g.parcelas.map(function(p){return p.id;})).replace(/"/g,'&quot;')})">🗑 Excluir</button>
+        </div>
       </div>
       <div style="padding:14px 18px;">
         <div style="display:flex;gap:24px;margin-bottom:12px;flex-wrap:wrap;">
@@ -2962,6 +2966,31 @@ function renderParcelamentos() {
       </div>
     </div>`;
   }).join('');
+}
+
+
+function excluirParcelamento(ids) {
+  if (!confirm('Excluir todas as parcelas deste parcelamento (' + ids.length + ' transacoes)?')) return;
+  showLoading(true);
+  var lotes = [];
+  for (var i = 0; i < ids.length; i += 400) {
+    var batch = db.batch();
+    ids.slice(i, i + 400).forEach(function(id) {
+      batch.delete(db.collection('transacoes').doc(id));
+    });
+    lotes.push(batch.commit());
+  }
+  Promise.all(lotes).then(function() {
+    // remove do cache
+    cacheParcelamentos = cacheParcelamentos.filter(function(t) { return ids.indexOf(t.id) === -1; });
+    cacheTx = cacheTx.filter(function(t) { return ids.indexOf(t.id) === -1; });
+    toast('Parcelamento excluido!', 'success');
+    showLoading(false);
+    renderPagina(paginaAtual);
+  }).catch(function(e) {
+    showLoading(false);
+    toast('Erro ao excluir: ' + e.message, 'error');
+  });
 }
 
 let adiantarGrupoKey = '';
