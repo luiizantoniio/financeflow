@@ -1138,8 +1138,11 @@ body {
         </button>
       </div>
       <div style="display:flex;gap:10px;align-items:center;">
-        <button class="btn btn-ghost" onclick="limparMesImport()" style="color:var(--red);border-color:#fecaca;">🗑️ Limpar mês atual</button>
-        <span style="font-size:0.78rem;color:var(--text3);">Remove todas as transações do mês/usuário selecionado</span>
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-ghost" onclick="limparMesImport(false)" style="color:var(--red);border-color:#fecaca;">🗑️ Limpar mês atual</button>
+          <button class="btn btn-ghost" onclick="limparMesImport(true)" style="color:var(--red);border-color:#fecaca;font-size:.82rem;">🗑️ Limpar tudo + parcelas futuras</button>
+        </div>
+        <span style="font-size:0.78rem;color:var(--text3);">Remove transações do usuário selecionado</span>
       </div>
     </div>
 
@@ -2277,21 +2280,35 @@ function renderImportar() {
   document.getElementById('triagemContainer').style.display = 'none';
 }
 
-function limparMesImport() {
-  const nomeUsr = usuarioImportAtual === 'luiz' ? 'Luiz' : 'Fernanda';
-  if (!confirm('Excluir TODAS as transacoes de ' + MES_PT[mesSel-1] + '/' + anoSel + ' para ' + nomeUsr + '?')) return;
+function limparMesImport(incluirParcelasFuturas) {
+  var nomeUsr = usuarioImportAtual === 'luiz' ? 'Luiz' : 'Fernanda';
+  var msg = incluirParcelasFuturas
+    ? 'Excluir TODAS as transacoes de ' + nomeUsr + ' (mes atual + parcelas futuras projetadas)?'
+    : 'Excluir todas as transacoes de ' + MES_PT[mesSel-1] + '/' + anoSel + ' para ' + nomeUsr + '?';
+  if (!confirm(msg)) return;
   showLoading(true);
 
-  // Busca so por mes (sem filtro usuario) para pegar transacoes antigas com campo email tambem
-  db.collection('transacoes').where('mes','==',mesStr()).get().then(function(snap) {
+  function pertenceAoUsuario(d) {
+    var u = d.usuario;
+    var e = d.email || '';
+    if (u) return u === usuarioImportAtual;
+    if (usuarioImportAtual === 'luiz')     return e.includes('luiz') || e === '';
+    if (usuarioImportAtual === 'fernanda') return e.includes('fernanda');
+    return false;
+  }
+
+  var query;
+  if (incluirParcelasFuturas) {
+    // busca todas as transacoes do usuario (sem filtro de mes)
+    query = db.collection('transacoes').get();
+  } else {
+    // busca so o mes atual
+    query = db.collection('transacoes').where('mes','==',mesStr()).get();
+  }
+
+  query.then(function(snap) {
     var docsParaDeletar = snap.docs.filter(function(d) {
-      var data = d.data();
-      var u = data.usuario;
-      var e = data.email || '';
-      if (u) return u === usuarioImportAtual;
-      if (usuarioImportAtual === 'luiz')     return e.includes('luiz') || e === '';
-      if (usuarioImportAtual === 'fernanda') return e.includes('fernanda');
-      return false;
+      return pertenceAoUsuario(d.data());
     });
 
     if (docsParaDeletar.length === 0) {
@@ -2308,7 +2325,7 @@ function limparMesImport() {
     }
     return Promise.all(lotes);
   }).then(function() {
-    toast('Mes limpo com sucesso!', 'success');
+    toast('Limpeza concluida com sucesso!', 'success');
     carregarDados();
   }).catch(function(e) {
     showLoading(false);
