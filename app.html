@@ -2803,11 +2803,17 @@ async function confirmarImportacao(saidas) {
     if (hashSet.has(hash)) continue; // duplicata
 
     const mesTx = (s.data||'').substring(0,7);
+    const parcelaAtual   = s.parcela      || null;
+    const totalParcelas  = s.totalParcelas || null;
+    // nomeBase limpo: remove sufixo de parcela para agrupar corretamente
+    const nomeBase = nomeAmigavel(s.nomeOriginal);
+
     const ref = db.collection('transacoes').doc();
     batch.set(ref, {
       data: s.data,
       nomeOriginal: s.nomeOriginal,
-      descricao: nomeAmigavel(s.nomeOriginal),
+      nomeBase,
+      descricao: nomeBase,
       valor: s.valor,
       tipo: s.tipo || 'debito',
       categoria: s.categoria || classificar(s.nomeOriginal),
@@ -2815,33 +2821,46 @@ async function confirmarImportacao(saidas) {
       usuario: usuarioImportAtual,
       mes: mesTx,
       hash,
-      parcela: s.parcela || null,
-      totalParcelas: s.totalParcelas || null,
+      parcela: parcelaAtual,
+      totalParcelas,
       criadoEm: new Date().toISOString()
     });
     hashSet.add(hash);
     count++;
 
-    // projetar parcelas futuras
-    if (s.parcela === 1 && s.totalParcelas > 1) {
-      for (let p = 2; p <= s.totalParcelas; p++) {
-        const dataFut = somarMeses(s.data, p - 1);
-        const hashFut = gerarHash(s.nomeOriginal + '_p' + p, dataFut, s.valor);
+    // Projetar parcelas RESTANTES a partir da parcela atual
+    // Ex: importou parcela 2/5 → projeta 3, 4 e 5
+    if (parcelaAtual && totalParcelas && parcelaAtual < totalParcelas) {
+      // Buscar hashes já existentes de TODOS os meses para este parcelamento
+      const snapParc = await db.collection('transacoes')
+        .where('nomeBase', '==', nomeBase)
+        .where('usuario', '==', usuarioImportAtual)
+        .get();
+      const parcelasExistentes = new Set(
+        snapParc.docs.map(function(d) { return d.data().parcela; }).filter(Boolean)
+      );
+
+      for (let p = parcelaAtual + 1; p <= totalParcelas; p++) {
+        if (parcelasExistentes.has(p)) continue; // já existe esta parcela
+        // data da parcela futura: meses a partir da data da parcela atual
+        const dataFut = somarMeses(s.data, p - parcelaAtual);
+        const hashFut = gerarHash(nomeBase + '|parc' + p + '/' + totalParcelas, dataFut, s.valor);
         if (hashSet.has(hashFut)) continue;
         const refFut = db.collection('transacoes').doc();
         batch.set(refFut, {
           data: dataFut,
           nomeOriginal: s.nomeOriginal,
-          descricao: nomeAmigavel(s.nomeOriginal),
+          nomeBase,
+          descricao: nomeBase,
           valor: s.valor,
-          tipo: s.tipo || 'credito',
+          tipo: s.tipo || 'debito',
           categoria: s.categoria || classificar(s.nomeOriginal),
           status: 'previsto',
           usuario: usuarioImportAtual,
           mes: dataFut.substring(0,7),
           hash: hashFut,
           parcela: p,
-          totalParcelas: s.totalParcelas,
+          totalParcelas,
           criadoEm: new Date().toISOString()
         });
         hashSet.add(hashFut);
@@ -3126,14 +3145,17 @@ function excluirFixo(id) {
 function renderParcelamentos() {
   const usr = (document.getElementById('parcFiltroUser')||{}).value || '';
 
-  // agrupar
+  // agrupar por nomeBase (campo salvo) ou nomeAmigavel como fallback
+  // key inclui totalParcelas para nao misturar parcelamentos diferentes do mesmo lugar
   const grupos = {};
   cacheParcelamentos.forEach(function(t) {
     if (usr && t.usuario !== usr) return;
-    const nomeBase = nomeAmigavel(t.nomeOriginal||t.descricao||'');
-    const key = nomeBase + '|' + (t.totalParcelas||1) + '|' + (t.usuario||'');
-    if (!grupos[key]) grupos[key] = { nome: nomeBase, totalParcelas: t.totalParcelas||1, usuario: t.usuario, parcelas: [] };
-    grupos[key].parcelas.push(t);
+    const nb = t.nomeBase || nomeAmigavel(t.nomeOriginal||t.descricao||'');
+    const key = nb + '|' + (t.totalParcelas||1) + '|' + (t.usuario||'');
+    if (!grupos[key]) grupos[key] = { nome: nb, totalParcelas: t.totalParcelas||1, usuario: t.usuario, parcelas: [] };
+    // evitar duplicatas na lista
+    const jaExiste = grupos[key].parcelas.some(function(p) { return p.parcela === t.parcela; });
+    if (!jaExiste) grupos[key].parcelas.push(t);
   });
 
   const el = document.getElementById('parcelamentosList');
@@ -3155,40 +3177,70 @@ function renderParcelamentos() {
       ? '<span class="badge badge-luiz">🟣 Luiz</span>'
       : '<span class="badge badge-fernanda">🌸 Fernanda</span>';
 
+    // timeline: mostra exatamente o que tem no banco, sem inventar posições
     const timeline = Array.from({ length: g.totalParcelas }, function(_,i) {
-      const p = g.parcelas.find(function(x) { return x.parcela === i+1; });
-      const cls = p?.adiantado ? 'adiantado' : (p?.status === 'confirmado' ? 'pago' : 'previsto');
-      const mes  = p?.mes ? MES_PT[parseInt(p.mes.split('-')[1])-1]?.substring(0,3) : '';
-      return `<div class="parc-dot">
-        <div class="parc-dot-circle ${cls}">${i+1}</div>
+      const numParc = i + 1;
+      const p   = g.parcelas.find(function(x) { return x.parcela === numParc; });
+      const cls = !p ? 'previsto' : (p.adiantado ? 'adiantado' : (p.status === 'confirmado' ? 'pago' : 'previsto'));
+      const mes = p && p.mes ? MES_PT[parseInt(p.mes.split('-')[1])-1]?.substring(0,3) : '?';
+      const title = p ? (p.status === 'confirmado' ? 'Paga' : 'Prevista') + ' — ' + mes : 'Nao encontrada';
+      return `<div class="parc-dot" title="${title}">
+        <div class="parc-dot-circle ${cls}">${numParc}</div>
         <div class="parc-dot-mes">${mes}</div>
       </div>`;
     }).join('');
 
+    // proxima parcela a vencer
+    const proxima = g.parcelas
+      .filter(function(p) { return p.status === 'previsto'; })
+      .sort(function(a,b) { return (a.parcela||0) - (b.parcela||0); })[0];
+
     return `<div class="section-card" style="margin-bottom:12px;">
       <div class="section-card-header">
-        <div>
-          <span class="section-card-title">${g.nome}</span>
-          <span style="margin-left:8px;">${usrBadge}</span>
+        <div style="display:flex;flex-direction:column;gap:2px;">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span class="section-card-title">${g.nome}</span>
+            ${usrBadge}
+          </div>
+          ${proxima ? `<span style="font-size:.72rem;color:var(--yellow);">⏰ Próxima: parcela ${proxima.parcela}/${g.totalParcelas} — ${proxima.mes ? MES_PT[parseInt(proxima.mes.split('-')[1])-1] : '?'} — ${fmtR(proxima.valor)}</span>` : '<span style="font-size:.72rem;color:var(--green);">✅ Quitado</span>'}
         </div>
         <div style="display:flex;gap:6px;">
-          ${previstas.length > 0 ? `<button class="btn btn-ghost" style="font-size:.8rem;padding:5px 10px;" onclick="abrirAdiantar(${JSON.stringify(key).replace(/"/g,'&quot;')})">⏩ Adiantar</button>` : ''}
+          ${previstas.length > 0 ? `<button class="btn btn-ghost" style="font-size:.8rem;padding:5px 10px;" onclick="abrirAdiantar('${key.replace(/'/g,"\'")}')">⏩ Adiantar</button>` : ''}
           <button class="btn btn-ghost" style="font-size:.8rem;padding:5px 10px;color:var(--red);border-color:#fecaca;" onclick="excluirParcelamento(${JSON.stringify(g.parcelas.map(function(p){return p.id;})).replace(/"/g,'&quot;')})">🗑 Excluir</button>
         </div>
       </div>
       <div style="padding:14px 18px;">
         <div style="display:flex;gap:24px;margin-bottom:12px;flex-wrap:wrap;">
           <span style="font-size:.82rem;color:var(--text2);">Progresso: <strong style="color:var(--text)">${pagas}/${g.totalParcelas}</strong></span>
-          <span style="font-size:.82rem;color:var(--text2);">Parcela: <strong style="color:var(--text)">${fmtR(valorParcela)}</strong></span>
+          <span style="font-size:.82rem;color:var(--text2);">Por parcela: <strong style="color:var(--text)">${fmtR(valorParcela)}</strong></span>
           <span style="font-size:.82rem;color:var(--text2);">Total: <strong style="color:var(--text)">${fmtR(total)}</strong></span>
-          <span style="font-size:.82rem;color:var(--text2);">Restante: <strong style="color:var(--red)">${fmtR(restante)}</strong></span>
+          <span style="font-size:.82rem;color:var(--red);">Restante: <strong>${fmtR(restante)}</strong></span>
         </div>
         <div class="parc-timeline">${timeline}</div>
+        <div style="margin-top:12px;">
+          ${(cfgGeral.notasParcelas && cfgGeral.notasParcelas[key]) ? `<div style="font-size:.75rem;color:var(--blue);margin-bottom:4px;">📝 ${cfgGeral.notasParcelas[key]}</div>` : ''}
+          <textarea
+            placeholder="📝 Adicionar nota (ex: TV Samsung 55&quot;)"
+            onchange="salvarNotaParcela(this.dataset.key, this.value)"
+            data-key="${key.replace(/"/g,'&quot;')}"
+            style="width:100%;padding:8px 10px;font-size:0.78rem;border:1.5px solid var(--border);border-radius:8px;resize:none;min-height:44px;font-family:'DM Sans',sans-serif;color:var(--text);background:var(--bg);outline:none;transition:border-color .2s;"
+            onfocus="this.style.borderColor='var(--luiz)'"
+            onblur="this.style.borderColor='var(--border)'"
+          >${(cfgGeral.notasParcelas && cfgGeral.notasParcelas[key]) ? cfgGeral.notasParcelas[key] : ''}</textarea>
+        </div>
       </div>
     </div>`;
   }).join('');
 }
 
+
+function salvarNotaParcela(key, valor) {
+  if (!cfgGeral.notasParcelas) cfgGeral.notasParcelas = {};
+  cfgGeral.notasParcelas[key] = valor;
+  db.collection('config').doc('geral').set({ notasParcelas: cfgGeral.notasParcelas }, { merge: true })
+    .then(function() { toast('Nota salva!', 'success'); })
+    .catch(function() { toast('Erro ao salvar nota.', 'error'); });
+}
 
 function excluirParcelamento(ids) {
   if (!confirm('Excluir todas as parcelas deste parcelamento (' + ids.length + ' transacoes)?')) return;
