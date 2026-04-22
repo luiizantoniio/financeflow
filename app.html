@@ -1138,9 +1138,10 @@ body {
         </button>
       </div>
       <div style="display:flex;gap:10px;align-items:center;">
-        <div style="display:flex;gap:8px;">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
           <button class="btn btn-ghost" onclick="limparMesImport(false)" style="color:var(--red);border-color:#fecaca;">🗑️ Limpar mês atual</button>
-          <button class="btn btn-ghost" onclick="limparMesImport(true)" style="color:var(--red);border-color:#fecaca;font-size:.82rem;">🗑️ Limpar tudo + parcelas futuras</button>
+          <button class="btn btn-ghost" onclick="limparMesImport(true)" style="color:var(--red);border-color:#fecaca;font-size:.82rem;">🗑️ Limpar tudo</button>
+          <button class="btn btn-ghost" onclick="limparSoParcelamentos()" style="color:var(--red);border-color:#fecaca;font-size:.82rem;">🗑️ Limpar só parcelamentos</button>
         </div>
         <span style="font-size:0.78rem;color:var(--text3);">Remove transações do usuário selecionado</span>
       </div>
@@ -2555,6 +2556,50 @@ function limparMesImport(incluirTudo) {
   });
 }
 
+function limparSoParcelamentos() {
+  var nomeUsr = usuarioImportAtual === 'luiz' ? 'Luiz' : 'Fernanda';
+  if (!confirm('Excluir TODOS os parcelamentos de ' + nomeUsr + ' (todos os meses)? As transações normais nao serao afetadas.')) return;
+  showLoading(true);
+
+  function ehDoUsuario(data) {
+    if (data.usuario) return data.usuario === usuarioImportAtual;
+    var e = data.email || '';
+    if (usuarioImportAtual === 'fernanda') return e.toLowerCase().includes('fernanda');
+    return e.toLowerCase().includes('luiz') || e === '';
+  }
+
+  // Busca todas as transacoes que tenham totalParcelas > 1
+  db.collection('transacoes').get().then(function(snap) {
+    var alvo = snap.docs.filter(function(d) {
+      var data = d.data();
+      return ehDoUsuario(data) && data.totalParcelas > 1;
+    });
+
+    console.log('Parcelamentos para deletar:', alvo.length);
+
+    if (alvo.length === 0) {
+      showLoading(false);
+      toast('Nenhum parcelamento encontrado.', 'info');
+      return Promise.resolve();
+    }
+
+    var lotes = [];
+    for (var i = 0; i < alvo.length; i += 400) {
+      var batch = db.batch();
+      alvo.slice(i, i + 400).forEach(function(d) { batch.delete(d.ref); });
+      lotes.push(batch.commit());
+    }
+    return Promise.all(lotes);
+  }).then(function(res) {
+    if (!res) return;
+    toast('' + (res.length > 0 ? 'Parcelamentos removidos!' : ''), 'success');
+    carregarDados();
+  }).catch(function(e) {
+    showLoading(false);
+    toast('Erro: ' + e.message, 'error');
+  });
+}
+
 // Upload
 const uploadZone = document.getElementById('uploadZone');
 uploadZone.addEventListener('click', function() { document.getElementById('fileInput').click(); });
@@ -2828,10 +2873,9 @@ async function confirmarImportacao(saidas) {
     hashSet.add(hash);
     count++;
 
-    // Projetar parcelas RESTANTES a partir da parcela atual
-    // Ex: importou parcela 2/5 → projeta 3, 4 e 5
-    if (parcelaAtual && totalParcelas && parcelaAtual < totalParcelas) {
-      // Buscar hashes já existentes de TODOS os meses para este parcelamento
+    // Projetar TODAS as parcelas: anteriores como confirmado, futuras como previsto
+    if (parcelaAtual && totalParcelas && totalParcelas > 1) {
+      // Buscar parcelas ja existentes no Firestore para nao duplicar
       const snapParc = await db.collection('transacoes')
         .where('nomeBase', '==', nomeBase)
         .where('usuario', '==', usuarioImportAtual)
@@ -2840,30 +2884,38 @@ async function confirmarImportacao(saidas) {
         snapParc.docs.map(function(d) { return d.data().parcela; }).filter(Boolean)
       );
 
-      for (let p = parcelaAtual + 1; p <= totalParcelas; p++) {
-        if (parcelasExistentes.has(p)) continue; // já existe esta parcela
-        // data da parcela futura: meses a partir da data da parcela atual
-        const dataFut = somarMeses(s.data, p - parcelaAtual);
-        const hashFut = gerarHash(nomeBase + '|parc' + p + '/' + totalParcelas, dataFut, s.valor);
-        if (hashSet.has(hashFut)) continue;
-        const refFut = db.collection('transacoes').doc();
-        batch.set(refFut, {
-          data: dataFut,
+      for (let p = 1; p <= totalParcelas; p++) {
+        if (p === parcelaAtual) continue;         // a parcela atual ja foi inserida acima
+        if (parcelasExistentes.has(p)) continue;  // ja existe no Firestore, nao duplicar
+
+        // data retroativa ou futura: subtraindo ou somando meses a partir da parcela atual
+        const diffMeses = p - parcelaAtual;
+        const dataParcela = somarMeses(s.data, diffMeses);
+        const hashP = gerarHash(nomeBase + '|parc' + p + '/' + totalParcelas, dataParcela, s.valor);
+        if (hashSet.has(hashP)) continue;
+
+        // Anteriores = confirmado (ja foram pagas)
+        // Futuras    = previsto
+        const statusP = p < parcelaAtual ? 'confirmado' : 'previsto';
+
+        const refP = db.collection('transacoes').doc();
+        batch.set(refP, {
+          data: dataParcela,
           nomeOriginal: s.nomeOriginal,
           nomeBase,
           descricao: nomeBase,
           valor: s.valor,
           tipo: s.tipo || 'debito',
           categoria: s.categoria || classificar(s.nomeOriginal),
-          status: 'previsto',
+          status: statusP,
           usuario: usuarioImportAtual,
-          mes: dataFut.substring(0,7),
-          hash: hashFut,
+          mes: dataParcela.substring(0, 7),
+          hash: hashP,
           parcela: p,
           totalParcelas,
           criadoEm: new Date().toISOString()
         });
-        hashSet.add(hashFut);
+        hashSet.add(hashP);
       }
     }
   }
