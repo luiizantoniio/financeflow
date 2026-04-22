@@ -1308,6 +1308,7 @@ body {
       <button class="mo-close" onclick="closeMo('moTx')">✕</button>
     </div>
     <input type="hidden" id="txId">
+    <input type="hidden" id="txNomeOriginal">
     <div class="fg-row">
       <div class="fg">
         <label>Data</label>
@@ -1765,6 +1766,29 @@ function carregarDados() {
     cacheEntradas      = snapToArr(results[1]);
     cacheEntradasFixas = snapToArr(results[2]);
     cacheFixos         = snapToArr(results[3]);
+
+    // Injetar gastos fixos como previsto em cacheTx se nao existirem no mes
+    const fixoIdsNoMes = new Set(cacheTx.filter(function(t){ return t.fixoId; }).map(function(t){ return t.fixoId; }));
+    cacheFixos.forEach(function(f) {
+      if (!fixoIdsNoMes.has(f.id)) {
+        // fixo nao tem transacao projetada neste mes — adicionar virtualmente
+        const d = new Date(anoSel, mesSel - 1, f.dia || 1);
+        cacheTx.push({
+          id: '__fixo__' + f.id,
+          data: d.toISOString().split('T')[0],
+          descricao: f.nome,
+          nomeOriginal: f.nome,
+          valor: f.valor,
+          tipo: 'fixo',
+          categoria: f.categoria,
+          status: 'previsto',
+          usuario: f.usuario || 'luiz',
+          mes: mesStr(),
+          fixoId: f.id,
+          _virtual: true
+        });
+      }
+    });
     cacheDividas       = snapToArr(results[4]);
     cacheAssinaturas   = snapToArr(results[5]);
     cacheAliases       = snapToArr(results[6]);
@@ -1977,6 +2001,7 @@ function renderTxDash(txArr) {
       <div class="tx-info">
         <div class="tx-nome" style="font-size:.82rem;">${isPrev?'🕐 ':''}${nome}</div>
         ${orig ? `<div class="tx-original">${orig}</div>` : ''}
+      ${t.nota ? `<div class="tx-original" style="color:var(--blue);font-style:italic;">📝 ${t.nota}</div>` : ''}
         <div class="tx-meta">
           <span class="tx-date">${fmtData(t.data)}</span>
           ${usrDot}
@@ -2052,12 +2077,19 @@ function renderCatGrid(txArr, pins) {
       <div class="cat-nome">${c.nome}</div>
       <div class="cat-valor" style="color:${c.cor}">${fmtR(gasto)}</div>
       ${limite > 0 ? `<div class="progress-bar"><div class="progress-fill ${over?'over':''}" style="width:${pct}%;background:${over?'':c.cor}"></div></div>` : ''}
-      ${over ? `<div class="cat-alerta">⚠️ Limite de ${fmtR(limite)} ultrapassado!</div>` : ''}
+      ${over ? `<div class="cat-alerta">⚠️ Limite de ${fmtR(limite)} ultrapassado!</div>
+      <textarea class="cat-nota-input" placeholder="O que aconteceu? (opcional)" onchange="salvarNotaLimite('${c.id}', this.value)" style="width:100%;margin-top:6px;padding:6px 8px;font-size:0.72rem;border:1.5px solid #fecaca;border-radius:7px;resize:none;min-height:50px;font-family:'DM Sans',sans-serif;color:var(--text);background:#fff;outline:none;">${(cfgGeral.notasLimite && cfgGeral.notasLimite[c.id]) || ''}</textarea>` : ''}
     </div>`;
   }).join('');
 
   return `<h3 style="font-size:.8rem;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px;">Categorias</h3>
     <div class="cat-grid">${cards}</div>`;
+}
+
+function salvarNotaLimite(catId, valor) {
+  if (!cfgGeral.notasLimite) cfgGeral.notasLimite = {};
+  cfgGeral.notasLimite[catId] = valor;
+  db.collection('config').doc('geral').set({ notasLimite: cfgGeral.notasLimite }, { merge: true });
 }
 
 async function togglePin(catId) {
@@ -2115,6 +2147,7 @@ function renderTxItem(t) {
     <div class="tx-info">
       <div class="tx-nome">${isPrev?'🕐 ':''} ${nome}</div>
       ${orig ? `<div class="tx-original">${orig}</div>` : ''}
+      ${t.nota ? `<div class="tx-original" style="color:var(--blue);font-style:italic;">📝 ${t.nota}</div>` : ''}
       <div class="tx-meta">
         <span class="tx-date">${fmtData(t.data)}</span>
         ${usrBadge}
@@ -2140,14 +2173,15 @@ function getTipoBadge(tipo) {
 
 // ===== TX ACTIONS =====
 function openModalTx(id) {
-  document.getElementById('txId').value   = '';
-  document.getElementById('txData').value = new Date().toISOString().split('T')[0];
-  document.getElementById('txDesc').value = '';
-  document.getElementById('txValor').value= '';
-  document.getElementById('txNota').value = '';
-  document.getElementById('txStatus').value  = 'confirmado';
-  document.getElementById('txUsuario').value = 'luiz';
-  document.getElementById('moTxTitle').textContent = 'Nova Transação';
+  document.getElementById('txId').value          = '';
+  document.getElementById('txNomeOriginal').value = '';
+  document.getElementById('txData').value         = new Date().toISOString().split('T')[0];
+  document.getElementById('txDesc').value         = '';
+  document.getElementById('txValor').value        = '';
+  document.getElementById('txNota').value         = '';
+  document.getElementById('txStatus').value       = 'confirmado';
+  document.getElementById('txUsuario').value      = 'luiz';
+  document.getElementById('moTxTitle').textContent = 'Nova Transacao';
   openMo('moTx');
 }
 
@@ -2163,13 +2197,19 @@ function editarTx(id) {
   document.getElementById('txTipo').value    = t.tipo || 'debito';
   document.getElementById('txStatus').value  = t.status || 'confirmado';
   document.getElementById('txUsuario').value = t.usuario || 'luiz';
-  document.getElementById('moTxTitle').textContent = 'Editar Transação';
+  document.getElementById('moTxTitle').textContent = 'Editar Transacao';
+  // guarda nomeOriginal para nao sobrescrever
+  document.getElementById('txNomeOriginal').value = t.nomeOriginal || '';
+  openMo('moTx');
+}
 
-  // abre modal de alias para editar categoria
-  document.getElementById('aliasTxId').value = t.id;
+function abrirAlias(id) {
+  const t = cacheTx.find(function(x) { return x.id === id; });
+  if (!t) return;
+  document.getElementById('aliasTxId').value     = t.id;
   document.getElementById('aliasNomeBase').value = nomeAmigavel(t.nomeOriginal||t.descricao||'').substring(0,20);
   document.getElementById('aliasPreviewNome').textContent = nomeAmigavel(t.nomeOriginal||t.descricao||'');
-  document.getElementById('aliasCat').value = t.categoria || '';
+  document.getElementById('aliasCat').value      = t.categoria || '';
   openMo('moAlias');
 }
 
@@ -2223,7 +2263,7 @@ function salvarTx() {
   if (!data || !desc || isNaN(valor)) { toast('Preencha todos os campos obrigatórios.','error'); return; }
 
   const doc = {
-    data, descricao: desc, nomeOriginal: desc, valor, categoria: cat,
+    data, descricao: desc, nomeOriginal: document.getElementById('txNomeOriginal').value || desc, valor, categoria: cat,
     tipo, status, usuario: usr, nota, mes: data.substring(0,7), criadoEm: new Date().toISOString()
   };
 
@@ -2246,19 +2286,41 @@ function salvarTx() {
 }
 
 function confirmarTx(id) {
+  if (id.startsWith('__fixo__')) {
+    // criar transacao real a partir do virtual
+    const t = cacheTx.find(function(x) { return x.id === id; });
+    if (!t) return;
+    const doc = Object.assign({}, t);
+    delete doc.id; delete doc._virtual;
+    doc.status = 'confirmado';
+    db.collection('transacoes').add(doc).then(function(ref) {
+      cacheTx = cacheTx.filter(function(x) { return x.id !== id; });
+      cacheTx.push(Object.assign({ id: ref.id }, doc));
+      toast('Transacao confirmada!','success');
+      renderPagina(paginaAtual);
+    });
+    return;
+  }
   db.collection('transacoes').doc(id).update({ status: 'confirmado' }).then(function() {
     const idx = cacheTx.findIndex(function(x) { return x.id === id; });
     if (idx >= 0) cacheTx[idx].status = 'confirmado';
-    toast('Transação confirmada!','success');
+    toast('Transacao confirmada!','success');
     renderPagina(paginaAtual);
   });
 }
 
 function excluirTx(id) {
-  if (!confirm('Excluir esta transação?')) return;
+  if (!confirm('Excluir esta transacao?')) return;
+  if (id.startsWith('__fixo__')) {
+    // transacao virtual de fixo — apenas remove do cache visual
+    cacheTx = cacheTx.filter(function(x) { return x.id !== id; });
+    toast('Use Gastos Fixos para excluir fixos.', 'info');
+    renderPagina(paginaAtual);
+    return;
+  }
   db.collection('transacoes').doc(id).delete().then(function() {
     cacheTx = cacheTx.filter(function(x) { return x.id !== id; });
-    toast('Transação excluída.','info');
+    toast('Transacao excluida.','info');
     renderPagina(paginaAtual);
   });
 }
