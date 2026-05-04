@@ -1222,9 +1222,9 @@ body {
 
     <div class="upload-zone" id="uploadZone">
       <div class="upload-icon">📁</div>
-      <div class="upload-text">Arraste o arquivo aqui ou clique para selecionar</div>
-      <div class="upload-sub">Aceita CSV e PDF do Nubank</div>
-      <input type="file" id="fileInput" accept=".csv,.pdf" style="display:none" onchange="processarArquivo(this.files[0])">
+      <div class="upload-text">Arraste os arquivos aqui ou clique para selecionar</div>
+      <div class="upload-sub">Aceita múltiplos CSVs do Nubank — extrato da conta + fatura do cartão de uma vez</div>
+      <input type="file" id="fileInput" accept=".csv,.pdf" style="display:none" multiple onchange="processarArquivos(this.files)">
     </div>
 
     <div id="importPreview" style="display:none; margin-top:16px;"></div>
@@ -2750,77 +2750,246 @@ uploadZone.addEventListener('dragleave', function() { uploadZone.classList.remov
 uploadZone.addEventListener('drop', function(e) {
   e.preventDefault();
   uploadZone.classList.remove('drag-over');
-  if (e.dataTransfer.files[0]) processarArquivo(e.dataTransfer.files[0]);
+  if (e.dataTransfer.files.length > 0) processarArquivos(e.dataTransfer.files);
 });
 
-async function processarArquivo(file) {
-  if (!file) return;
+// Detectar tipo de CSV do Nubank
+function detectarTipoCSV(texto) {
+  const header = texto.split('\n')[0].toLowerCase();
+  if (header.includes('title') && header.includes('amount')) return 'fatura';       // fatura do cartão
+  if (header.includes('identificador') && header.includes('descri')) return 'conta'; // extrato NuConta
+  return 'desconhecido';
+}
+
+// Processar múltiplos arquivos (extrato conta + fatura cartão)
+async function processarArquivos(files) {
+  if (!files || files.length === 0) return;
   showLoading(true);
+
   try {
-    let linhas = [];
-    if (file.name.endsWith('.csv')) {
-      const texto = await file.text();
-      linhas = processarCSV(texto);
-    } else if (file.name.endsWith('.pdf')) {
-      linhas = await processarPDF(file);
+    let textoFatura = null;
+    let textoConta  = null;
+    let pdfFiles    = [];
+
+    for (const file of files) {
+      if (file.name.endsWith('.pdf')) {
+        pdfFiles.push(file);
+      } else if (file.name.endsWith('.csv')) {
+        const texto = await file.text();
+        const tipo  = detectarTipoCSV(texto);
+        if (tipo === 'fatura')  textoFatura = texto;
+        else if (tipo === 'conta') textoConta = texto;
+        else {
+          // fallback: tentar processar como arquivo genérico
+          textoConta = texto;
+        }
+      }
     }
+
+    let todasLinhas = [];
+
+    // 1. Processar extrato da conta PRIMEIRO (para montar o mapa de PIX via crédito)
+    let pixCreditoIds = new Set(); // UUIDs de PIX pagos com cartão — ignorar na conta
+    if (textoConta) {
+      const { linhas, idsPixCredito } = processarCSVConta(textoConta);
+      pixCreditoIds = idsPixCredito;
+      todasLinhas = todasLinhas.concat(linhas);
+    }
+
+    // 2. Processar fatura do cartão
+    if (textoFatura) {
+      const linhas = processarCSVFatura(textoFatura);
+      todasLinhas = todasLinhas.concat(linhas);
+    }
+
+    // 3. PDFs
+    for (const file of pdfFiles) {
+      const linhas = await processarPDF(file);
+      todasLinhas = todasLinhas.concat(linhas);
+    }
+
+    // Se só um arquivo CSV genérico foi enviado (comportamento legado)
+    if (!textoFatura && !textoConta && pdfFiles.length === 0 && files.length === 1 && files[0].name.endsWith('.csv')) {
+      const texto = await files[0].text();
+      todasLinhas = processarCSV(texto);
+    }
+
     showLoading(false);
-    exibirPreview(linhas);
+
+    if (todasLinhas.length === 0) {
+      toast('Nenhuma transação encontrada nos arquivos.', 'error');
+      return;
+    }
+
+    exibirPreview(todasLinhas);
+
   } catch(e) {
     showLoading(false);
-    toast('Erro ao processar arquivo: ' + e.message,'error');
+    toast('Erro ao processar arquivos: ' + e.message, 'error');
+    console.error(e);
   }
 }
 
-function processarCSV(texto) {
+// Manter compatibilidade com chamada de arquivo único
+async function processarArquivo(file) {
+  if (!file) return;
+  processarArquivos([file]);
+}
+
+// Processar extrato da NuConta (Data,Valor,Identificador,Descrição)
+// Retorna transações válidas E o set de UUIDs de PIX via crédito (para ignorar)
+function processarCSVConta(texto) {
+  const linhas = texto.split('\n').map(function(l) { return l.trim(); }).filter(Boolean);
+  if (linhas.length < 2) return { linhas: [], idsPixCredito: new Set() };
+
+  // Parser CSV respeitando aspas
+  function parseCSVLinha(linha) {
+    const campos = [];
+    let atual = '', dentro = false;
+    for (let i = 0; i < linha.length; i++) {
+      const c = linha[i];
+      if (c === '"') { dentro = !dentro; }
+      else if (c === ',' && !dentro) { campos.push(atual); atual = ''; }
+      else { atual += c; }
+    }
+    campos.push(atual);
+    return campos;
+  }
+
+  const header = parseCSVLinha(linhas[0]).map(function(h) { return h.toLowerCase().trim(); });
+  const iData  = header.findIndex(function(h) { return h.includes('data'); });
+  const iValor = header.findIndex(function(h) { return h.includes('valor'); });
+  const iId    = header.findIndex(function(h) { return h.includes('identificador') || h.includes('id'); });
+  const iDesc  = header.findIndex(function(h) { return h.includes('descri'); });
+
+  // Primeiro passo: identificar UUIDs de PIX via crédito
+  // São as linhas "Valor adicionado na conta por cartão de crédito"
+  // O mesmo UUID aparece duas vezes: uma positiva (adicionado) e uma negativa (PIX enviado)
+  const idsPixCredito = new Set();
+  linhas.slice(1).forEach(function(linha) {
+    const p = parseCSVLinha(linha);
+    const desc = (p[iDesc] || '').toLowerCase();
+    if (desc.includes('valor adicionado') && desc.includes('cartão de crédito')) {
+      if (iId >= 0 && p[iId]) idsPixCredito.add(p[iId].trim());
+    }
+  });
+
+  // Segundo passo: processar transações válidas
+  const resultados = [];
+  linhas.slice(1).forEach(function(linha) {
+    const p   = parseCSVLinha(linha);
+    const id  = iId >= 0 ? (p[iId] || '').trim() : '';
+    const desc = p[iDesc] || '';
+    const valor = parseFloat(p[iValor]);
+
+    // Ignorar PIX via crédito (ambas as linhas — positiva e negativa)
+    if (idsPixCredito.has(id)) return;
+
+    // Ignorar pagamento de fatura (é só movimentação interna)
+    if (desc.toLowerCase().includes('pagamento de fatura')) return;
+
+    // Ignorar entradas por enquanto (triagem separada)
+    if (isNaN(valor) || valor === 0) return;
+
+    const data      = formatarDataISO((p[iData] || '').trim());
+    const descLimpa = desc.trim();
+    const isEntrada = valor > 0;
+    const tipo      = descLimpa.toLowerCase().includes('pix') ? 'pix'
+                    : descLimpa.toLowerCase().includes('débito') || descLimpa.toLowerCase().includes('debito') ? 'debito'
+                    : 'pix';
+
+    resultados.push({
+      data,
+      nomeOriginal: descLimpa,
+      valor: Math.abs(valor),
+      tipo: isEntrada ? '__credito' : tipo,
+      _fonte: 'conta'
+    });
+  });
+
+  return { linhas: resultados, idsPixCredito };
+}
+
+// Processar fatura do cartão (date,title,amount)
+// PIX pagos com cartão já foram removidos da conta — aqui ficam como tipo 'credito'
+function processarCSVFatura(texto) {
   const linhas = texto.split('\n').map(function(l) { return l.trim(); }).filter(Boolean);
   if (linhas.length < 2) return [];
 
-  const header = linhas[0].toLowerCase();
+  const mesRef = anoSel + '-' + String(mesSel).padStart(2,'0');
   const resultados = [];
 
-  // formato cartão crédito: date,title,amount
-  if (header.includes('title') && header.includes('amount')) {
-    // Fatura de cartão: importada no mês de PAGAMENTO (ex: fatura de abril paga em maio)
-    // As transações devem aparecer no mês selecionado, não no mês original do gasto
-    const mesRef = anoSel + '-' + String(mesSel).padStart(2,'0');
-
-    linhas.slice(1).forEach(function(linha) {
-      const partes = linha.split(',');
-      if (partes.length < 3) return;
-      const dataOriginal = partes[0].trim();
-      const nome  = partes.slice(1, partes.length-1).join(',').trim().replace(/^"|"$/g,'');
-      const valor = parseFloat(partes[partes.length-1]);
-      if (isNaN(valor)) return;
-      if (valor < 0) return; // crédito/pagamento recebido — ignorar
-
-      // PIX no cartão de crédito: marcado para deduplicação posterior
-      const isPix = /pix/i.test(nome);
-
-      // Substituir mês da transação pelo mês de pagamento da fatura (mês selecionado)
-      // mantendo o DIA original para referência
-      var diaOriginal = (dataOriginal.split('-')[2] || '01').padStart(2,'0');
-      var dataPagamento = mesRef + '-' + diaOriginal;
-
-      resultados.push({ data: dataPagamento, dataOriginal, nomeOriginal: nome, valor, tipo: 'credito', isPix });
-    });
-  } else {
-    // NuConta: colunas variáveis
-    const cols = linhas[0].split(',').map(function(c) { return c.toLowerCase().trim(); });
-    const iData  = cols.findIndex(function(c) { return c.includes('data'); });
-    const iDesc  = cols.findIndex(function(c) { return c.includes('descri'); });
-    const iValor = cols.findIndex(function(c) { return c.includes('valor'); });
-
-    linhas.slice(1).forEach(function(linha) {
-      const p = linha.split(',');
-      const data  = iData  >= 0 ? p[iData].trim()  : '';
-      const nome  = iDesc  >= 0 ? p[iDesc].trim()  : '';
-      const valor = iValor >= 0 ? Math.abs(parseFloat(p[iValor])) : 0;
-      if (!nome || isNaN(valor) || valor === 0) return;
-      const isCredito = iValor >= 0 && parseFloat(p[iValor]) > 0;
-      resultados.push({ data: formatarDataISO(data), nomeOriginal: nome, valor, tipo: isCredito ? '__credito' : 'debito' });
-    });
+  // Parser CSV respeitando aspas duplas escapadas ("" dentro de "")
+  function parseCSVLinha(linha) {
+    const campos = [];
+    let atual = '', dentro = false;
+    for (let i = 0; i < linha.length; i++) {
+      const c = linha[i];
+      if (c === '"') {
+        if (dentro && linha[i+1] === '"') { atual += '"'; i++; } // "" → "
+        else { dentro = !dentro; }
+      } else if (c === ',' && !dentro) {
+        campos.push(atual); atual = '';
+      } else {
+        atual += c;
+      }
+    }
+    campos.push(atual);
+    return campos;
   }
+
+  linhas.slice(1).forEach(function(linha) {
+    const p = parseCSVLinha(linha);
+    if (p.length < 3) return;
+    const dataOriginal = p[0].trim();
+    const nome         = p.slice(1, p.length - 1).join(',').trim();
+    const valor        = parseFloat(p[p.length - 1]);
+
+    if (isNaN(valor)) return;
+    if (valor <= 0)   return; // pagamentos recebidos no cartão — ignorar
+
+    // Ignorar "Limite convertido em saldo" — é crédito especial do Nubank, não compra
+    if (/limite convertido/i.test(nome)) return;
+
+    // Usar mês de pagamento (mês selecionado), mantendo o dia original
+    const diaOriginal   = (dataOriginal.split('-')[2] || '01').padStart(2, '0');
+    const dataPagamento = mesRef + '-' + diaOriginal;
+
+    resultados.push({
+      data: dataPagamento,
+      dataOriginal,
+      nomeOriginal: nome,
+      valor,
+      tipo: 'credito',
+      _fonte: 'fatura'
+    });
+  });
+
+  return resultados;
+}
+
+// processarCSV legado — detecta tipo e delega para função especializada
+function processarCSV(texto) {
+  const tipo = detectarTipoCSV(texto);
+  if (tipo === 'fatura') return processarCSVFatura(texto);
+  if (tipo === 'conta')  return processarCSVConta(texto).linhas;
+  // fallback genérico
+  const linhas = texto.split('\n').map(function(l) { return l.trim(); }).filter(Boolean);
+  if (linhas.length < 2) return [];
+  const cols  = linhas[0].split(',').map(function(c) { return c.toLowerCase().trim(); });
+  const iData  = cols.findIndex(function(c) { return c.includes('data'); });
+  const iDesc  = cols.findIndex(function(c) { return c.includes('descri'); });
+  const iValor = cols.findIndex(function(c) { return c.includes('valor'); });
+  const resultados = [];
+  linhas.slice(1).forEach(function(linha) {
+    const p = linha.split(',');
+    const data  = iData  >= 0 ? p[iData].trim()  : '';
+    const nome  = iDesc  >= 0 ? p[iDesc].trim()  : '';
+    const valor = iValor >= 0 ? Math.abs(parseFloat(p[iValor])) : 0;
+    if (!nome || isNaN(valor) || valor === 0) return;
+    const isEntrada = iValor >= 0 && parseFloat(p[iValor]) > 0;
+    resultados.push({ data: formatarDataISO(data), nomeOriginal: nome, valor, tipo: isEntrada ? '__credito' : 'debito' });
+  });
   return resultados;
 }
 
@@ -2882,36 +3051,46 @@ function exibirPreview(linhas) {
   if (saidas.length > 0) {
     const previewEl = document.getElementById('importPreview');
     previewEl.style.display = 'block';
-    const temCredito = saidas.some(function(s) { return s.tipo === 'credito'; });
-    const temPix     = saidas.some(function(s) { return s.isPix; });
-    const mesNome    = MES_PT[mesSel-1] + '/' + anoSel;
+    const temCredito  = saidas.some(function(s) { return s.tipo === 'credito'; });
+    const temConta    = saidas.some(function(s) { return s._fonte === 'conta'; });
+    const qtdFatura   = saidas.filter(function(s) { return s._fonte === 'fatura'; }).length;
+    const qtdConta    = saidas.filter(function(s) { return s._fonte === 'conta'; }).length;
+    const mesNome     = MES_PT[mesSel-1] + '/' + anoSel;
+    const multiArquivo = temCredito && temConta;
 
     previewEl.innerHTML = `
       <div class="section-card">
         <div class="section-card-header">
-          <span class="section-card-title">📋 Preview — ${saidas.length} saídas encontradas</span>
+          <span class="section-card-title">📋 Preview — ${saidas.length} transações encontradas</span>
           <button class="btn btn-primary" onclick="confirmarImportacao(${JSON.stringify(saidas).replace(/"/g,'&quot;')})">✅ Confirmar importação</button>
         </div>
-        ${temCredito ? `<div style="padding:10px 16px;background:#eef2ff;border-bottom:1px solid var(--border);font-size:.82rem;color:var(--luiz);display:flex;gap:8px;align-items:center;">
-          💳 <strong>Fatura do cartão:</strong> as compras serão registradas em <strong>${mesNome}</strong> (mês de pagamento da fatura)
+        ${multiArquivo ? `<div style="padding:10px 16px;background:#f0fdf4;border-bottom:1px solid var(--border);font-size:.82rem;color:#16a34a;display:flex;gap:8px;align-items:center;">
+          ✅ <strong>Dois arquivos detectados:</strong> ${qtdConta} da conta corrente + ${qtdFatura} da fatura do cartão — PIX via crédito já removidos automaticamente
         </div>` : ''}
-        ${temPix ? `<div style="padding:10px 16px;background:#fff7ed;border-bottom:1px solid var(--border);font-size:.82rem;color:#d97706;display:flex;gap:8px;align-items:center;">
-          ⚡ <strong>PIX no cartão detectado:</strong> será ignorado automaticamente se já existe na conta corrente
+        ${temCredito && !multiArquivo ? `<div style="padding:10px 16px;background:#eef2ff;border-bottom:1px solid var(--border);font-size:.82rem;color:var(--luiz);display:flex;gap:8px;align-items:center;">
+          💳 <strong>Fatura do cartão:</strong> compras registradas em <strong>${mesNome}</strong> (mês de pagamento)
         </div>` : ''}
         <div class="preview-table-wrap">
           <table class="data-table">
-            <thead><tr><th>Data na fatura</th><th>Nome</th><th>Categoria</th><th>Valor</th><th>Parcela</th><th>Tipo</th></tr></thead>
+            <thead><tr><th>Data</th><th>Nome</th><th>Categoria</th><th>Valor</th><th>Parcela</th><th>Origem</th></tr></thead>
             <tbody>
               ${saidas.map(function(s) {
                 const cat = categorias.find(function(c) { return c.id === s.categoria; });
                 const dataExibir = s.dataOriginal ? fmtData(s.dataOriginal) : fmtData(s.data);
+                const origemBadge = s._fonte === 'fatura'
+                  ? '<span style="color:var(--luiz);font-weight:600;">💳 Cartão</span>'
+                  : s._fonte === 'conta'
+                  ? '<span style="color:var(--text2);">🏦 Conta</span>'
+                  : s.tipo === 'credito'
+                  ? '<span style="color:var(--luiz);">💳 Cartão</span>'
+                  : '<span style="color:var(--text2);">🏦 Conta</span>';
                 return `<tr>
                   <td>${dataExibir}</td>
                   <td><div style="font-size:.85rem;font-weight:600;">${nomeAmigavel(s.nomeOriginal)}</div><div style="font-size:.7rem;color:var(--text3)">${s.nomeOriginal}</div></td>
                   <td>${cat?cat.icon+' '+cat.nome:'📦 Diversas'}</td>
                   <td style="font-weight:700;">${fmtR(s.valor)}</td>
                   <td>${s.parcela?s.parcela+'/'+s.totalParcelas:'-'}</td>
-                  <td>${s.isPix?'<span style="color:#d97706;">⚡ PIX</span>':s.tipo==='credito'?'💳 Crédito':'🏦 Débito'}</td>
+                  <td>${origemBadge}</td>
                 </tr>`;
               }).join('')}
             </tbody>
@@ -3000,38 +3179,21 @@ function confirmarTriagem() {
 async function confirmarImportacao(saidas) {
   showLoading(true);
 
-  // buscar hashes existentes do mês/usuario
+  // buscar hashes existentes do mês/usuario para evitar duplicatas no Firestore
   const snap = await db.collection('transacoes')
     .where('mes','==',mesStr())
     .where('usuario','==',usuarioImportAtual)
     .get();
   const hashSet = new Set(snap.docs.map(function(d) { return d.data().hash; }).filter(Boolean));
 
-  // Para deduplicação de PIX no cartão: buscar PIX do mês por valor+nome
-  // PIX aparece tanto na NuConta (debito) quanto no cartão (credito) → evitar duplicata
-  const txsMes = snap.docs.map(function(d) { return d.data(); });
-  const pixExistentes = new Set(
-    txsMes
-      .filter(function(t) { return t.tipo === 'pix'; })
-      .map(function(t) { return normalizarTexto(t.nomeOriginal||t.descricao||'') + '|' + Number(t.valor).toFixed(2); })
-  );
-
   const batch = db.batch();
   let count = 0;
-  let pixDuplicatas = 0;
 
   for (const s of saidas) {
-    // Verificar duplicata de PIX: se esta transação é PIX no cartão E já existe PIX igual na conta
-    if (s.isPix) {
-      const chavePix = normalizarTexto(s.nomeOriginal||'') + '|' + Number(s.valor).toFixed(2);
-      if (pixExistentes.has(chavePix)) {
-        pixDuplicatas++;
-        continue; // PIX duplicado → ignorar
-      }
-    }
-
+    // Hash garante que mesmo estabelecimento em datas diferentes não é duplicata
+    // (gasolina toda semana no mesmo posto = hashes diferentes por causa da data)
     const hash = gerarHash(s.nomeOriginal, s.data, s.valor);
-    if (hashSet.has(hash)) continue; // duplicata
+    if (hashSet.has(hash)) continue; // já existe — pular
 
     const mesTx = (s.data||'').substring(0,7);
     const parcelaAtual   = s.parcela      || null;
@@ -3108,9 +3270,7 @@ async function confirmarImportacao(saidas) {
 
   await batch.commit();
   showLoading(false);
-  let msg = count + ' transações importadas!';
-  if (pixDuplicatas > 0) msg += ' ' + pixDuplicatas + ' PIX duplicado(s) ignorado(s).';
-  toast(msg, 'success');
+  toast(count + ' transações importadas!', 'success');
   document.getElementById('importPreview').style.display = 'none';
   carregarDados();
 }
