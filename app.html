@@ -2910,16 +2910,15 @@ function processarCSVConta(texto) {
 }
 
 // Processar fatura do cartão (date,title,amount)
-// LÓGICA:
+// LÓGICA SIMPLES:
 //   - Compras individuais ficam na DATA ORIGINAL (abril = abril) → para ver onde gastou
-//   - Pagamentos da fatura (negativos no CSV) viram UMA linha "Pagamento Fatura" no mês selecionado → para controle de caixa
+//   - Pagamentos recebidos (valores negativos) são IGNORADOS — usuário lança manualmente quando paga
 //   - PIX pagos via cartão (identificados pelo extrato da conta) ficam na fatura → não duplicam
 function processarCSVFatura(texto, textoConta, idsPixCreditoConta) {
   const linhas = texto.split('\n').map(function(l) { return l.trim(); }).filter(Boolean);
   if (linhas.length < 2) return [];
 
-  const mesPagamento = anoSel + '-' + String(mesSel).padStart(2,'0');
-  const resultados   = [];
+  const resultados = [];
 
   // Parser CSV respeitando aspas duplas escapadas
   function parseCSVLinha(linha) {
@@ -2940,8 +2939,6 @@ function processarCSVFatura(texto, textoConta, idsPixCreditoConta) {
     return campos;
   }
 
-  let totalPagamentos = 0; // soma dos pagamentos já feitos (aparece como negativo na fatura)
-
   linhas.slice(1).forEach(function(linha) {
     const p     = parseCSVLinha(linha);
     if (p.length < 3) return;
@@ -2950,47 +2947,22 @@ function processarCSVFatura(texto, textoConta, idsPixCreditoConta) {
     const valor        = parseFloat(p[p.length - 1]);
     if (isNaN(valor)) return;
 
-    // Pagamento recebido na fatura (valor negativo) = você já pagou parte da fatura
-    // Acumula para criar a linha de "Pagamento Fatura" no mês correto
-    if (valor < 0) {
-      totalPagamentos += Math.abs(valor);
-      return;
-    }
+    // Ignorar pagamentos recebidos (valor negativo) — usuário lança manualmente
+    if (valor < 0) return;
 
     // Ignorar itens especiais do Nubank que não são gastos reais
     if (/limite convertido/i.test(nome)) return;
 
     // Usar a DATA ORIGINAL da compra — assim abril fica em abril
     resultados.push({
-      data: dataOriginal,          // data real da compra
+      data: dataOriginal,
       dataOriginal: dataOriginal,
       nomeOriginal: nome,
       valor,
       tipo: 'credito',
-      _fonte: 'fatura',
-      _mesPagamento: mesPagamento  // guardado para referência
+      _fonte: 'fatura'
     });
   });
-
-  // Adicionar linha de PAGAMENTO DA FATURA no mês selecionado (maio)
-  // Representa o dinheiro que saiu/vai sair da conta para pagar o cartão
-  if (totalPagamentos > 0) {
-    // Calcular saldo devedor = total das compras - pagamentos já feitos
-    const totalCompras = resultados.reduce(function(s, r) { return s + r.valor; }, 0);
-    const saldoDevedor = Math.max(0, totalCompras - totalPagamentos);
-
-    // Linha do pagamento já feito (ex: R$ 3.102,68 pagos em abril que aparecem em maio)
-    resultados.push({
-      data: mesPagamento + '-01',
-      nomeOriginal: '💳 Pagamento Fatura Nubank',
-      valor: totalPagamentos,
-      tipo: 'debito',
-      categoria: 'administracao',
-      _fonte: 'pagamento_fatura',
-      _ehPagamentoFatura: true,
-      _saldoDevedor: saldoDevedor
-    });
-  }
 
   return resultados;
 }
@@ -3066,7 +3038,6 @@ function exibirPreview(linhas) {
 
   // detectar parcelamentos e classificar categoria
   saidas.forEach(function(l) {
-    if (l._ehPagamentoFatura) return; // linha de pagamento da fatura não precisa de categoria
     const m = (l.nomeOriginal||'').match(/[Pp]arcela\s+(\d+)\/(\d+)|-\s*(\d+)\/(\d+)/);
     if (m) {
       l.parcela       = parseInt(m[1]||m[3]);
@@ -3081,14 +3052,11 @@ function exibirPreview(linhas) {
   previewEl.style.display = 'block';
 
   // Separar para o preview
-  const comprasFatura   = saidas.filter(function(s) { return s._fonte === 'fatura' && !s._ehPagamentoFatura; });
-  const pagamentoFatura = saidas.filter(function(s) { return s._ehPagamentoFatura; });
-  const txsConta        = saidas.filter(function(s) { return s._fonte === 'conta'; });
-  const txsOutras       = saidas.filter(function(s) { return !s._fonte; });
+  const comprasFatura = saidas.filter(function(s) { return s._fonte === 'fatura'; });
+  const txsConta      = saidas.filter(function(s) { return s._fonte === 'conta'; });
 
-  const temFatura  = comprasFatura.length > 0;
-  const temConta   = txsConta.length > 0;
-  const mesNome    = MES_PT[mesSel-1] + '/' + anoSel;
+  const temFatura = comprasFatura.length > 0;
+  const temConta  = txsConta.length > 0;
 
   // Calcular totais por mês das compras da fatura (para mostrar no cabeçalho)
   const mesesFatura = {};
@@ -3103,7 +3071,7 @@ function exibirPreview(linhas) {
     <button class="btn btn-primary" onclick="confirmarImportacao(${JSON.stringify(saidas).replace(/"/g,'&quot;')})">✅ Confirmar importação</button>
   </div>`;
 
-  // Banner explicativo quando tem fatura + conta
+  // Banner explicativo
   if (temFatura) {
     const mesesStr = Object.keys(mesesFatura).map(function(m) {
       return MES_PT[parseInt(m.split('-')[1])-1] + ': ' + fmtR(mesesFatura[m]);
@@ -3116,14 +3084,8 @@ function exibirPreview(linhas) {
       <div style="color:var(--text2);padding-left:20px;">
         ${mesesStr}
       </div>
-    </div>`;
-  }
-
-  if (pagamentoFatura.length > 0) {
-    const pf = pagamentoFatura[0];
-    html += `<div style="padding:12px 16px;background:#f0fdf4;border-bottom:1px solid var(--border);font-size:.82rem;color:#16a34a;">
-      <div style="display:flex;gap:8px;align-items:center;">
-        ✅ <strong>Pagamento da fatura</strong> — <strong>${fmtR(pf.valor)}</strong> registrado em <strong>${mesNome}</strong> (saiu da sua conta)
+      <div style="color:var(--text3);padding-left:20px;font-size:.75rem;margin-top:4px;">
+        💡 Quando pagar a fatura, lance manualmente em + Transação
       </div>
     </div>`;
   }
@@ -3144,24 +3106,18 @@ function exibirPreview(linhas) {
         ${todasParaTabela.map(function(s) {
           const cat = categorias.find(function(c) { return c.id === s.categoria; });
           const dataExibir = fmtData(s.data);
+          const origemBadge = s._fonte === 'fatura'
+            ? '<span style="color:var(--luiz);">💳 Cartão</span>'
+            : '<span style="color:var(--text2);">🏦 Conta</span>';
 
-          let origemBadge;
-          if (s._ehPagamentoFatura) {
-            origemBadge = '<span style="color:#16a34a;font-weight:600;">✅ Pag. Fatura · ' + mesNome + '</span>';
-          } else if (s._fonte === 'fatura') {
-            origemBadge = '<span style="color:var(--luiz);">💳 Cartão</span>';
-          } else {
-            origemBadge = '<span style="color:var(--text2);">🏦 Conta</span>';
-          }
-
-          return `<tr ${s._ehPagamentoFatura ? 'style="background:#f0fdf4;"' : ''}>
+          return `<tr>
             <td>${dataExibir}</td>
             <td>
               <div style="font-size:.85rem;font-weight:600;">${nomeAmigavel(s.nomeOriginal)}</div>
               ${s.nomeOriginal !== nomeAmigavel(s.nomeOriginal) ? `<div style="font-size:.7rem;color:var(--text3)">${s.nomeOriginal}</div>` : ''}
             </td>
-            <td>${s._ehPagamentoFatura ? '—' : (cat ? cat.icon+' '+cat.nome : '📦 Diversas')}</td>
-            <td style="font-weight:700;${s._ehPagamentoFatura ? 'color:#16a34a;' : ''}">${fmtR(s.valor)}</td>
+            <td>${cat ? cat.icon+' '+cat.nome : '📦 Diversas'}</td>
+            <td style="font-weight:700;">${fmtR(s.valor)}</td>
             <td>${origemBadge}</td>
           </tr>`;
         }).join('')}
@@ -3262,15 +3218,11 @@ async function confirmarImportacao(saidas) {
   let count = 0;
 
   for (const s of saidas) {
-    // Pagamento da fatura: mês é sempre o mês selecionado (onde saiu da conta)
-    // Compras da fatura: mês é o mês original da compra (para ver onde gastou)
-    const mesTx = s._ehPagamentoFatura
-      ? mesStr()
-      : (s.data||'').substring(0,7);
-
-    const hash = gerarHash(s.nomeOriginal, s._ehPagamentoFatura ? mesStr()+'-pag' : s.data, s.valor);
+    // Hash garante que mesmo estabelecimento em datas diferentes não é duplicata
+    const hash = gerarHash(s.nomeOriginal, s.data, s.valor);
     if (hashSet.has(hash)) continue; // já existe — pular
 
+    const mesTx = (s.data||'').substring(0,7);
     const parcelaAtual   = s.parcela      || null;
     const totalParcelas  = s.totalParcelas || null;
     const nomeBase = nomeAmigavel(s.nomeOriginal);
@@ -3295,7 +3247,7 @@ async function confirmarImportacao(saidas) {
     hashSet.add(hash);
     count++;
 
-    // Projetar TODAS as parcelas: anteriores como confirmado, futuras como previsto
+    // Projetar APENAS parcelas FUTURAS como previsto (não polui meses anteriores)
     if (parcelaAtual && totalParcelas && totalParcelas > 1) {
       // Buscar parcelas ja existentes no Firestore para nao duplicar
       const snapParc = await db.collection('transacoes')
@@ -3306,19 +3258,14 @@ async function confirmarImportacao(saidas) {
         snapParc.docs.map(function(d) { return d.data().parcela; }).filter(Boolean)
       );
 
-      for (let p = 1; p <= totalParcelas; p++) {
-        if (p === parcelaAtual) continue;         // a parcela atual ja foi inserida acima
+      // Só projeta parcelas FUTURAS (p > parcelaAtual), pula a atual e as anteriores
+      for (let p = parcelaAtual + 1; p <= totalParcelas; p++) {
         if (parcelasExistentes.has(p)) continue;  // ja existe no Firestore, nao duplicar
 
-        // data retroativa ou futura: subtraindo ou somando meses a partir da parcela atual
         const diffMeses = p - parcelaAtual;
         const dataParcela = somarMeses(s.data, diffMeses);
         const hashP = gerarHash(nomeBase + '|parc' + p + '/' + totalParcelas, dataParcela, s.valor);
         if (hashSet.has(hashP)) continue;
-
-        // Anteriores = confirmado (ja foram pagas)
-        // Futuras    = previsto
-        const statusP = p < parcelaAtual ? 'confirmado' : 'previsto';
 
         const refP = db.collection('transacoes').doc();
         batch.set(refP, {
@@ -3329,7 +3276,7 @@ async function confirmarImportacao(saidas) {
           valor: s.valor,
           tipo: s.tipo || 'debito',
           categoria: s.categoria || classificar(s.nomeOriginal),
-          status: statusP,
+          status: 'previsto',
           usuario: usuarioImportAtual,
           mes: dataParcela.substring(0, 7),
           hash: hashP,
